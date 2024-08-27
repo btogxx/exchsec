@@ -1,0 +1,172 @@
+#! /bin/bash
+
+database=~/.exchsec
+db_salt="6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"
+db_iv="d4735e3a265e16eee03f59718b9b5d03"
+passwd=""
+
+usage() {
+cat << EOF
+usage: exchsec command arguments
+command:
+  cat                      输出密钥信息
+  add     [id] [keyfile]   添加密钥
+  del     [id]             删除密钥
+  crypt   [id] [infile]    为指定标识的用户加解密
+                           根据文件后缀判定为加密还是解密
+arguments:
+  [id]                      用户标识
+  [infile]                  输入文件，待加解密的文件
+EOF
+	exit
+}
+
+exchsec_dbcout() {
+	openssl enc -aes-256-cbc -d -K $passwd -S $db_salt -iv $db_iv -in $database
+}
+
+exchsec_dbcin() {
+	local ff=$(mktemp)
+	openssl enc -aes-256-cbc -e -K $passwd -S $db_salt -iv $db_iv -out $ff
+	mv $ff $database
+}
+
+exchsec_init() {
+	local passwd_1
+	local passwd_2
+
+	if [ -f $database ]; then
+		read -s -p "请输入主密码：" passwd_1
+		echo
+		passwd=$(echo $passwd_1 | openssl sha256 -r | head -c 64)
+		[ "$(exchsec_dbcout | grep "^;.*")" != "; exchsec database" ] && {
+			echo "密码错误"
+			exit
+		}
+	else
+		read -s -p "请输入主密码：" passwd_1
+		echo
+		read -s -p "请再次输入主密码：" passwd_2
+		echo
+		[ "$passwd_1" != "$passwd_2" ] && {
+			echo "输入的密码不一致！"
+			exit
+		}
+		passwd=$(echo $passwd_1 | openssl sha256 -r | head -c 64)
+		echo "; exchsec database" | exchsec_dbcin
+	fi
+	return 0
+}
+
+exchsec_add() {
+	[ $# -eq 0 ] && {
+		echo "缺少参数"
+		usage
+	}
+	local u=$1
+	shift
+
+	[ $# -eq 0 ] && {
+		echo "缺少参数"
+		usage
+	}
+	local infile=$1
+	shift
+	[ ! -f $infile ] && {
+		echo $infile 参数应该是一个文件
+		usage
+	}
+	exchsec_init
+	(
+		exchsec_dbcout | awk -v name=$u -F ',' '{if ($2 != name) print $0}'
+		printf "%s,%s\n" $(openssl sha256 -r $infile | head -c 64) $u
+	) | exchsec_dbcin
+}
+
+exchsec_del() {
+	[ $# -eq 0 ] && {
+		echo "缺少参数"
+		usage
+	}
+	local u=$1
+	shift
+	exchsec_init
+	(
+		exchsec_dbcout | awk -v name=$u -F ',' '{if ($2 != name) print $0}'
+	) | exchsec_dbcin
+}
+
+exchsec_crypt() {
+	[ $# -eq 0 ] && {
+		echo "缺少参数"
+		usage
+	}
+	local u=$1
+	shift
+
+	[ $# -eq 0 ] && {
+		echo "缺少参数"
+		usage
+	}
+	local infile=$1
+	shift
+	[ ! -f $infile ] && {
+		echo $infile 参数应该是一个文件
+		usage
+	}
+
+	exchsec_init
+	local d=$(dirname $infile)
+	local f=$(basename $infile)
+	local shaseed=$(exchsec_dbcout | awk -v name=$u -F ',' '{if ($2 == name) print $1}')
+	[ -z "$shaseed" ] && {
+		echo 用户id（$u）不合法
+		exit
+	}
+	if [[ $infile == *.sec ]]; then
+		local outfile=$d/${f: 17: -4}
+		local shak="$(basename $infile)"
+	else
+		local outfile=$d/$(openssl rand -hex 8)-$f.sec
+		local shak="$(basename $outfile)"
+	fi
+	K=$(printf  $shaseed | openssl sha256 -r -hmac  "K:$shak" | head -c 64)
+	S=$(printf  $shaseed | openssl sha256 -r -hmac  "S:$shak" | head -c 64)
+	iv=$(printf $shaseed | openssl sha256 -r -hmac "iv:$shak" | head -c 32)
+	if [[ $infile == *.sec ]]; then
+		if [ $# -gt 0 -a "$1" = "-" ]; then
+			openssl enc -aes-256-cbc -d -K $K -S $S -iv $iv -in $infile
+		else
+			openssl enc -aes-256-cbc -d -K $K -S $S -iv $iv -in $infile -out $outfile
+		fi
+	else
+		openssl enc -aes-256-cbc -e -K $K -S $S -iv $iv -in $infile -out $outfile
+	fi
+}
+
+[ ! -f $database ] && {
+	echo "密钥数据库文件不存在，请初始化密钥数据库"
+	exchsec_init
+	exit 0
+}
+
+op=$1
+shift
+case $op in
+	cat)
+		exchsec_init
+		exchsec_dbcout
+		;;
+	add)
+		exchsec_add $*
+		;;
+	del)
+		exchsec_del $*
+		;;
+	crypt)
+		exchsec_crypt $*
+		;;
+	*)
+		usage
+		;;
+esac
